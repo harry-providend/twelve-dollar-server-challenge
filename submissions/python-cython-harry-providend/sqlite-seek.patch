@@ -1,0 +1,143 @@
+SQLite 3.53.4: let seeks continue from the cursor's current leaf page.
+
+Applied by build.sh to the SQLite source tree before the amalgamation is generated.
+
+1. src/vdbe.c, OP_OpenRead: a correlated subquery opens its read cursor once per outer
+   row. When the cursor is already open on the same b-tree, keep the BtCursor and its
+   position (resetting the VdbeCursor exactly as allocateCursor() does) instead of
+   closing it and allocating a new one.
+2. src/btree.c, sqlite3BtreeIndexMoveto(): the existing shortcut that searches the
+   current leaf page instead of descending from the root only applies on the last page
+   of the index. Also take it on any leaf page whose first cell is <= the key and whose
+   last cell is > the key.
+3. src/btree.c, sqlite3BtreeTableMoveto(): the same for table b-trees: when the current
+   leaf page's first and last rowids bracket the key, search that page only (stock
+   SQLite only special-cases key == current + 1).
+
+Checked with SQLite's own test suite (veryquick, 330,400 tests, assertions on: the same
+28 failing cases as unpatched SQLite, all permission tests that fail when run as root)
+and a differential fuzzer against unpatched SQLite. Results are identical; seeks that
+move to nearby keys skip the descent from the root.
+
+--- a/src/vdbe.c
++++ b/src/vdbe.c
+@@ -4441,6 +4441,29 @@
+   assert( pOp->p1>=0 );
+   assert( nField>=0 );
+   testcase( nField==0 );  /* Table with INTEGER PRIMARY KEY and nothing else */
++  /* A read cursor reopened on the same b-tree (a correlated subquery runs
++  ** OP_OpenRead once per outer row) keeps its BtCursor and its position, so
++  ** that the next seek can start from where the previous one ended instead
++  ** of from the root.  The VdbeCursor is reset as allocateCursor() would. */
++  pCur = p->apCsr[pOp->p1];
++  if( wrFlag==0 && pCur && pCur->eCurType==CURTYPE_BTREE
++   && pCur->pgnoRoot==p2 && pCur->iDb==iDb && pCur->nField==nField
++   && pCur->pKeyInfo==pKeyInfo && pCur->isTable==(pOp->p4type!=P4_KEYINFO)
++  ){
++    BtCursor *pBtCur = pCur->uc.pCursor;
++    memset(pCur, 0, offsetof(VdbeCursor,pAltCursor));
++    pCur->eCurType = CURTYPE_BTREE;
++    pCur->nField = nField;
++    pCur->aOffset = &pCur->aType[nField];
++    pCur->uc.pCursor = pBtCur;
++    pCur->iDb = iDb;
++    pCur->nullRow = 1;
++    pCur->isOrdered = 1;
++    pCur->pgnoRoot = p2;
++    pCur->pKeyInfo = pKeyInfo;
++    pCur->isTable = pOp->p4type!=P4_KEYINFO;
++    goto open_cursor_set_hints;
++  }
+   pCur = allocateCursor(p, pOp->p1, nField, CURTYPE_BTREE);
+   if( pCur==0 ) goto no_mem;
+   pCur->iDb = iDb;
+--- a/src/btree.c
++++ b/src/btree.c
+@@ -5802,6 +5802,18 @@
+ **     *pRes>0      The cursor is left pointing at an entry that
+ **                  is larger than intKey.
+ */
++/*
++** The integer key of cell idx on the table leaf page pPage.
++*/
++static int tableLeafKey(MemPage *pPage, int idx, i64 *pKey){
++  u8 *pCell = findCellPastPtr(pPage, idx);
++  while( 0x80 <= *(pCell++) ){
++    if( pCell>=pPage->aDataEnd ) return SQLITE_CORRUPT_PAGE(pPage);
++  }
++  getVarint(pCell, (u64*)pKey);
++  return SQLITE_OK;
++}
++
+ int sqlite3BtreeTableMoveto(
+   BtCursor *pCur,          /* The cursor to be moved */
+   i64 intKey,              /* The table key */
+@@ -5852,6 +5864,27 @@
+   pCur->pBtree->nSeek++;   /* Performance measurement during testing */
+ #endif
+ 
++  /* If the cursor is on a leaf page whose first and last keys bracket
++  ** intKey, the row (if any) is on that page: search it without starting
++  ** again from the root.  This is the table counterpart of case (2) in
++  ** sqlite3BtreeIndexMoveto(), for any leaf page instead of the last one. */
++  if( pCur->eState==CURSOR_VALID
++   && pCur->iPage>0
++   && pCur->pPage->intKeyLeaf
++   && pCur->pPage->isInit
++   && pCur->pPage->nCell>0
++  ){
++    i64 kLo, kHi;
++    if( tableLeafKey(pCur->pPage, 0, &kLo)==SQLITE_OK && kLo<=intKey
++     && tableLeafKey(pCur->pPage, pCur->pPage->nCell-1, &kHi)==SQLITE_OK
++     && intKey<=kHi
++    ){
++      pCur->info.nSize = 0;
++      pCur->curFlags &= ~(BTCF_AtLast|BTCF_ValidNKey|BTCF_ValidOvfl);
++      goto moveto_table_search_page;
++    }
++  }
++
+   rc = moveToRoot(pCur);
+   if( rc ){
+     if( rc==SQLITE_EMPTY ){
+@@ -5868,6 +5901,7 @@
+   assert( pCur->iPage==0 || pCur->apPage[0]->intKey==pCur->curIntKey );
+   assert( pCur->curIntKey );
+ 
++moveto_table_search_page:
+   for(;;){
+     int lwr, upr, idx, c;
+     Pgno chldPg;
+@@ -6093,6 +6127,32 @@
+     }
+     pIdxKey->errCode = SQLITE_OK;
+   }
++
++  /*    (3) If the cursor is on any other leaf page whose first cell is less
++  **        than or equal to the search key and whose last cell is greater
++  **        than it, the key's position is on that page: search it without
++  **        going back to root.  indexCellCompare() returns 99 for a cell
++  **        that overflows, which must not count as "greater".
++  */
++  if( pCur->eState==CURSOR_VALID
++   && pCur->iPage>0
++   && pCur->pPage->leaf
++   && pCur->pPage->isInit
++   && pCur->pPage->nCell>1
++  ){
++    int cHi;
++    if( indexCellCompare(pCur->pPage, 0, pIdxKey, xRecordCompare)<=0
++     && pIdxKey->errCode==SQLITE_OK
++     && (cHi = indexCellCompare(pCur->pPage, pCur->pPage->nCell-1, pIdxKey,
++                                xRecordCompare))>0
++     && cHi!=99
++     && pIdxKey->errCode==SQLITE_OK
++    ){
++      pCur->curFlags &= ~(BTCF_ValidOvfl|BTCF_AtLast);
++      goto bypass_moveto_root;
++    }
++    pIdxKey->errCode = SQLITE_OK;
++  }
+ 
+   rc = moveToRoot(pCur);
+   if( rc ){

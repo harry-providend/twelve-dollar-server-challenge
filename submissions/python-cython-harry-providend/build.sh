@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the app as a normal user:
-#   1. SQLite 3.53.4 from source (Ubuntu's pinned orig tarball, sha256-checked), amalgamated;
+#   1. SQLite 3.53.4 from source (Ubuntu's pinned orig tarball, sha256-checked), patched with
+#      sqlite-seek.patch, amalgamated;
 #   2. Cython (pinned, build-time only) turns fastserver.pyx into C;
 #   3. both are compiled with -O3 and linked with LTO into one CPython extension next to server.py,
 #      twice: the second build uses the profile of a training run of the first (PGO).
@@ -28,8 +29,11 @@ SQLITE_DEFS=(
 )
 CFLAGS=(-O3 -march=native -fPIC -flto=auto -fvisibility=hidden -fno-strict-aliasing)
 
+SQLITE_DIR=".deps/sqlite3-$SQLITE_VERSION"
+PATCH_SHA256="$(sha256sum sqlite-seek.patch | cut -d' ' -f1)"
+
 mkdir -p .deps build
-if [ ! -f ".deps/sqlite3-$SQLITE_VERSION/sqlite3.c" ]; then
+if [ ! -f "$SQLITE_DIR/sqlite3.c" ] || [ "$(cat "$SQLITE_DIR/.patched" 2>/dev/null)" != "$PATCH_SHA256" ]; then
   if [ ! -f ".deps/$SQLITE_TARBALL" ]; then
     for url in "${SQLITE_URLS[@]}"; do
       curl -fsSL --retry 3 -o ".deps/$SQLITE_TARBALL.part" "$url" && break || rm -f ".deps/$SQLITE_TARBALL.part"
@@ -37,12 +41,13 @@ if [ ! -f ".deps/sqlite3-$SQLITE_VERSION/sqlite3.c" ]; then
     mv ".deps/$SQLITE_TARBALL.part" ".deps/$SQLITE_TARBALL"
   fi
   echo "$SQLITE_SHA256  .deps/$SQLITE_TARBALL" | sha256sum -c -
-  rm -rf ".deps/sqlite3-$SQLITE_VERSION"
+  rm -rf "$SQLITE_DIR"
   tar -xJf ".deps/$SQLITE_TARBALL" -C .deps
+  patch -d "$SQLITE_DIR" -p1 --quiet < sqlite-seek.patch
   # The amalgamation (one sqlite3.c) is generated with the Jim Tcl bundled in the source tree.
-  (cd ".deps/sqlite3-$SQLITE_VERSION" && ./configure --disable-tcl >/dev/null && make sqlite3.c >/dev/null)
+  (cd "$SQLITE_DIR" && ./configure --disable-tcl >/dev/null && make sqlite3.c >/dev/null)
+  echo "$PATCH_SHA256" > "$SQLITE_DIR/.patched"
 fi
-SQLITE_DIR=".deps/sqlite3-$SQLITE_VERSION"
 
 "$PY" -m venv --clear .venv
 .venv/bin/pip install --disable-pip-version-check --no-input --quiet --only-binary=:all: -r requirements.txt

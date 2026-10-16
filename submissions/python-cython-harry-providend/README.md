@@ -4,7 +4,7 @@
 |---|---|
 | Language | Python 3.12.3 (Ubuntu 24.04's `python3`) hosting a Cython 3.1.4 extension module |
 | Framework | none: an epoll HTTP/1.1 server written in Cython (`fastserver.pyx`) |
-| SQLite | 3.53.4, built from source and linked into the extension (C API, prepared statements) |
+| SQLite | 3.53.4, built from source with a small seek patch, linked into the extension (C API, prepared statements) |
 | JSON, JWT | written in Cython: strict JSON parser and writer, SHA-256/HMAC, base64url |
 | **Nginx or direct** | **Direct**: serves `0.0.0.0:80` itself |
 
@@ -23,7 +23,8 @@ SQLITE_PATH=... JWT_SECRET=... HOST=0.0.0.0 PORT=80 bash start.sh
 ```
 
 `build.sh` downloads SQLite's source from the Ubuntu archive (`sqlite3_3.53.4.orig.tar.xz`, checked
-against a pinned SHA-256) and generates the amalgamation with the Jim Tcl bundled in the tree.
+against a pinned SHA-256), applies `sqlite-seek.patch` and generates the amalgamation with the Jim Tcl
+bundled in the tree.
 
 ## Measured
 
@@ -36,9 +37,10 @@ posts per 217 requests, reading ids from the latest feed). The FastAPI row is
 | | mixed req/s | `GET /feed` req/s | `GET /posts/:id` req/s |
 |---|---:|---:|---:|
 | Python / FastAPI + uvicorn (#1) | 5,936 | 5,952 | 7,339 |
-| **Python / Cython (this)** | **69,616** | **54,581** | **164,768** |
+| **Python / Cython (this)** | **79,182** | **60,130** | **159,554** |
 
-With `wrk -t3 -c128` the mixed load reaches 71–76k req/s; with `-c64` wrk itself becomes the limit.
+Mixed is the median of three runs (76.7k–80.0k). With `wrk -t3 -c128` the mixed load reaches 82–84k
+req/s; with `-c64` wrk itself is close to its limit.
 Writes alone (likes and posts) run at about 64k/s, held for 60 s with the WAL staying at ~26 MB.
 
 `bench/load.js` with k6 at 15,000 users (the most open connections this test machine allows), 60 s
@@ -79,10 +81,32 @@ against a synthetic database with a load-test-like request mix (`pgo_train.py`, 
 the real database), and rebuilds with the recorded profile. This alone is +10–20%; SQLite's bytecode
 interpreter benefits most. If training fails, the build falls back to a normal optimized build.
 
+**SQLite patched so seeks continue from where the cursor is** (`sqlite-seek.patch`, about 70 lines).
+All SQL is unchanged; the patch makes SQLite's own engine do less for the same statements. The
+feed's like counts are a correlated subquery, and SQLite closes and reopens its cursor for each of
+the 20 rows and searches the likes index from its root every time, although all 20 posts' likes are
+next to each other. The patch (1) keeps a read cursor that is reopened on the same b-tree, and its
+position, (2) lets an index seek search the current leaf page when that page's first and last
+entries bracket the key (stock SQLite does this only on the last page), and (3) does the same for
+rowid seeks (stock SQLite only special-cases `rowid + 1`; the feed walks posts newest first). The
+feed query goes from 15.7 to 11.0 µs in SQLite. Verified with SQLite's own test suite built from the
+patched source with assertions on (`veryquick`, 330,400 tests: the same 28 failures as unpatched
+SQLite, all permission tests that fail when run as root) and a differential fuzzer that runs random
+seeks, joins, correlated subqueries and writes on 512-byte pages against unpatched SQLite: identical
+results, with all three new paths taken tens of thousands of times per run.
+
 **No mmap, a large page cache.** With `mmap_size > 0` in WAL mode, SQLite looks up every page fetch
 in the WAL index, even for pages it has cached, and hot pages have many versions in the WAL: that
 lookup was 12% of the profile. With mmap off and a 256 MiB page cache, cache hits skip it entirely
 (+15% on the mixed load).
+
+**Tried and not kept.** Stripping SQLite with ~35 `SQLITE_OMIT_*` options at amalgamation time (the
+grammar is regenerated, so this goes beyond compile flags) removes 23% of its code but measured no
+runtime gain: those features live in prepare-time code, and statements are prepared once. Several
+option combinations also do not build or cannot read this schema (`OMIT_ATTACH` with
+`OMIT_VACUUM`, `OMIT_FOREIGN_KEY` rejects `REFERENCES`), so it adds risk for nothing. Rewriting the
+feed SQL (ascending scans, one grouped range count, `IN` lists) was slower or no faster than the
+reference query.
 
 **JSON.** Responses are written straight into an output buffer in key order. String escaping checks 8
 bytes at a time for `"`, `\` and control characters. The request parser is a strict RFC 8259
