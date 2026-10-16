@@ -1,0 +1,2 @@
+# Build-time only: the server imports nothing outside the standard library and its own extension.
+Cython==3.1.4
